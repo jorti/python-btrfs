@@ -321,12 +321,14 @@ class FileSystem(object):
         max_key = Key(max_vaddr, 255, ULLONG_MAX)
         extent = None
         for header, data in btrfs.ioctl.search(self.fd, tree, min_key, max_key):
-            if header.type == BLOCK_GROUP_ITEM_KEY:
-                continue
-            elif header.type == EXTENT_ITEM_KEY:
+            if header.type == EXTENT_ITEM_KEY:
                 if extent is not None:
                     yield extent
                 extent = ExtentItem(header, data)
+            elif header.type == METADATA_ITEM_KEY:
+                if extent is not None:
+                    yield extent
+                extent = MetaDataItem(header, data)
             elif header.type == EXTENT_DATA_REF_KEY:
                 extent.append_extent_data_ref(header, data)
             elif header.type == SHARED_DATA_REF_KEY:
@@ -436,13 +438,13 @@ class ExtentItem(object):
         self.vaddr = header.objectid
         self.length = header.offset
         self.refs, self.generation, self.flags = ExtentItem.extent_item.unpack_from(data, 0)
-        self.extent_data_refs = []
-        self.shared_data_refs = []
         pos = ExtentItem.extent_item.size
-        while pos < len(data):
-            inline_ref_type, inline_ref_offset = \
-                ExtentItem.extent_inline_ref.unpack_from(data, pos)
-            if self.flags == EXTENT_FLAG_DATA:
+        if self.flags == EXTENT_FLAG_DATA:
+            self.extent_data_refs = []
+            self.shared_data_refs = []
+            while pos < len(data):
+                inline_ref_type, inline_ref_offset = \
+                    ExtentItem.extent_inline_ref.unpack_from(data, pos)
                 if inline_ref_type == EXTENT_DATA_REF_KEY:
                     pos += 1
                     self.extent_data_refs.append(ExtentDataRef(data, pos))
@@ -451,6 +453,8 @@ class ExtentItem(object):
                     pos += 1
                     self.shared_data_refs.append(SharedDataRef(data, pos))
                     pos += SharedDataRef.shared_data_ref.size
+        elif self.flags == EXTENT_FLAG_TREE_BLOCK:
+            self.tree_block_info = TreeBlockInfo(data, pos)
 
     def append_extent_data_ref(self, header, data):
         self.extent_data_refs.append(ExtentDataRef(data, 0))
@@ -462,6 +466,30 @@ class ExtentItem(object):
         return "extent vaddr {0} length {1} refs {2} gen {3} flags {4}".format(
             self.vaddr, self.length, self.refs, self.generation,
             btrfs.utils.extent_flags_str(self.flags))
+
+
+class MetaDataItem(object):
+    def __init__(self, header, data):
+        self.key = Key(header.objectid, header.type, header.offset)
+        self.vaddr = header.objectid
+        self.skinny_level = header.offset
+        self.refs, self.generation, self.flags = ExtentItem.extent_item.unpack_from(data, 0)
+        pos = ExtentItem.extent_item.size
+        inline_ref_type, inline_ref_offset = \
+            ExtentItem.extent_inline_ref.unpack_from(data, pos)
+        if inline_ref_type != TREE_BLOCK_REF_KEY:
+            raise Exception("BUG: expected inline TREE_BLOCK_REF in METADATA_ITEM")
+        self.backref_root = inline_ref_offset
+        pos += ExtentItem.extent_inline_ref.size
+        if pos < len(data):
+            raise Exception("BUG: additional data after TREE_BLOCK_REF in METADATA_ITEM: ".format(
+                data[pos:]))
+
+    def __str__(self):
+        return "metadata vaddr {0} refs {1} gen {2} flags {3} tree block skinny level {4} " \
+            "backref root {5}".format(self.vaddr, self.refs, self.generation,
+                                      btrfs.utils.extent_flags_str(self.flags),
+                                      self.skinny_level, self.backref_root)
 
 
 class ExtentDataRef(object):
@@ -484,3 +512,26 @@ class SharedDataRef(object):
 
     def __str__(self):
         return "shared data backref parent {0} count {1}".format(self.parent, self.count)
+
+
+class TreeBlockInfo(object):
+    tree_block_info = struct.Struct("<QBQB")
+
+    def __init__(self, data, pos):
+        tb_objectid, tb_type, tb_offset, self.level = \
+            TreeBlockInfo.tree_block_info.unpack_from(data, pos)
+        self.key = Key(tb_objectid, tb_type, tb_offset)
+        pos += TreeBlockInfo.tree_block_info.size
+        inline_ref_type, inline_ref_offset = \
+            ExtentItem.extent_inline_ref.unpack_from(data, pos)
+        if inline_ref_type != TREE_BLOCK_REF_KEY:
+            raise Exception("BUG: expected inline TREE_BLOCK_REF after tree_block_info")
+        self.backref_root = inline_ref_offset
+        pos += ExtentItem.extent_inline_ref.size
+        if pos < len(data):
+            raise Exception("BUG: additional data after TREE_BLOCK_REF in EXTENT_ITEM: ".format(
+                data[pos:]))
+
+    def __str__(self):
+        return "tree block key {0} level {1} backref root {2}".format(
+            self.key, self.level, self.backref_root)

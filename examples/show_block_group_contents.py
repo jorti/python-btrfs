@@ -15,3 +15,6 @@ for extent in fs.extents(vaddr, vaddr + block_group.length - 1):
             print("    " + str(data_ref))
         for shared_ref in extent.shared_data_refs:
             print("    " + str(shared_ref))
+    elif isinstance(extent, btrfs.ctree.ExtentItem) and \
+            extent.flags == btrfs.ctree.EXTENT_FLAG_TREE_BLOCK:
+        print("    " + str(extent.tree_block_info))
